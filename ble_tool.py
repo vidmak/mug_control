@@ -157,8 +157,10 @@ async def connect_and_monitor(device):
                             # Drink is too cold, set target to 50°C (minimum heating)
                             if target_temp != 50.0:
                                 try:
-                                    # 50°C = 5000 = 0x8813 in little-endian
-                                    new_target_bytes = bytes([0x13, 0x88])
+                                    # The mug expects big-endian, so to get 50°C we need 0x8813
+                                    # 0x8813 in big-endian = 34867, but the mug scales it to 50°C
+                                    new_target_bytes = bytes([0x88, 0x13])  # 0x8813 for 50°C
+                                    print(f"   🔄 Using big-endian encoding (0x8813) for 50°C")
                                     
                                     # Check if characteristic supports write
                                     if "write" in target_char.properties:
