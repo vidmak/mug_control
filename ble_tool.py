@@ -96,6 +96,15 @@ async def connect_and_monitor(device):
             services = list(client.services)
             print(f"📋 Found {len(services)} services")
             
+            # Debug: Show all characteristics and their properties
+            print("\n🔍 All available characteristics:")
+            for svc in services:
+                print(f"  Service: {svc.uuid}")
+                for ch in svc.characteristics:
+                    props = ",".join(sorted(ch.properties))
+                    print(f"    Char: {ch.uuid} | props={props}")
+            print()
+            
             # Find both temperature characteristics
             target_char = None
             drink_char = None
@@ -118,6 +127,9 @@ async def connect_and_monitor(device):
             if not drink_char:
                 print("⚠️  Drink temperature characteristic not found")
                 return True
+            
+            # Run write tests to debug the issue
+            await test_write_operations(client, target_char)
             
             # Monitor connection status
             print("📊 Monitoring temperatures...")
@@ -159,20 +171,36 @@ async def connect_and_monitor(device):
                                 try:
                                     # 50°C = 5000 = 0x8813 in little-endian
                                     new_target_bytes = bytes([0x13, 0x88])
-                                    await client.write_gatt_char(target_char, new_target_bytes, response=False)
-                                    print(f"🔥 Drink too cold ({drink_temp:.1f}°C), setting target to 50°C")
+                                    
+                                    # Check if characteristic supports write
+                                    if "write" in target_char.properties or "write-without-response" in target_char.properties:
+                                        # Use write-without-response for immediate effect
+                                        await client.write_gatt_char(target_char, new_target_bytes, response=False)
+                                        print(f"🔥 Drink too cold ({drink_temp:.1f}°C), setting target to 50°C")
+                                        print(f"   Wrote bytes: {new_target_bytes.hex(' ').upper()} to {target_char.uuid}")
+                                    else:
+                                        print(f"⚠️  Target characteristic doesn't support write operations")
+                                        
                                 except Exception as e:
                                     print(f"⚠️  Failed to set target temperature: {e}")
+                                    print(f"   Characteristic properties: {target_char.properties}")
                         elif drink_temp > 40.0:
                             # Drink is warm enough, turn off heating
                             if target_temp != 0.0:
                                 try:
                                     # 0°C = 0 = 0x0000
                                     new_target_bytes = bytes([0x00, 0x00])
-                                    await client.write_gatt_char(target_char, new_target_bytes, response=False)
-                                    print(f"❄️  Drink warm enough ({drink_temp:.1f}°C), turning off heating")
+                                    
+                                    if "write" in target_char.properties or "write-without-response" in target_char.properties:
+                                        await client.write_gatt_char(target_char, new_target_bytes, response=False)
+                                        print(f"❄️  Drink warm enough ({drink_temp:.1f}°C), turning off heating")
+                                        print(f"   Wrote bytes: {new_target_bytes.hex(' ').upper()} to {target_char.uuid}")
+                                    else:
+                                        print(f"⚠️  Target characteristic doesn't support write operations")
+                                        
                                 except Exception as e:
                                     print(f"⚠️  Failed to turn off heating: {e}")
+                                    print(f"   Characteristic properties: {target_char.properties}")
                     
                     # Wait before next check
                     await asyncio.sleep(3)
@@ -205,6 +233,54 @@ async def set_target_temperature(client, target_char, temperature_celsius):
     except Exception as e:
         print(f"❌ Failed to set temperature: {e}")
         return False
+
+
+async def test_write_operations(client, target_char):
+    """Test different write operations to debug the issue."""
+    print("\n🧪 Testing write operations...")
+    
+    test_values = [
+        (50.0, "50°C (minimum heating)"),
+        (0.0, "0°C (off)"),
+        (55.0, "55°C (test)"),
+        (60.0, "60°C (test)")
+    ]
+    
+    for temp, description in test_values:
+        try:
+            temp_value = int(temp * 100)
+            temp_bytes = temp_value.to_bytes(2, byteorder='little')
+            
+            print(f"  Testing {description}: {temp_bytes.hex(' ').upper()}")
+            
+            # Try both write methods
+            if "write" in target_char.properties:
+                await client.write_gatt_char(target_char, temp_bytes, response=True)
+                print(f"    ✅ Write with response: OK")
+            else:
+                print(f"    ❌ Write with response: Not supported")
+            
+            if "write-without-response" in target_char.properties:
+                await client.write_gatt_char(target_char, temp_bytes, response=False)
+                print(f"    ✅ Write without response: OK")
+            else:
+                print(f"    ❌ Write without response: Not supported")
+                
+            # Wait a moment and read back
+            await asyncio.sleep(1)
+            try:
+                read_value = await client.read_gatt_char(target_char)
+                read_temp = int.from_bytes(read_value, byteorder='little') / 100.0
+                print(f"    📖 Read back: {read_temp}°C ({read_value.hex(' ').upper()})")
+            except Exception as e:
+                print(f"    📖 Read back failed: {e}")
+                
+        except Exception as e:
+            print(f"    ❌ Test failed: {e}")
+        
+        print()
+    
+    print("🧪 Write testing complete")
 
 
 async def main():
