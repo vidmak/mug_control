@@ -96,15 +96,6 @@ async def connect_and_monitor(device):
             services = list(client.services)
             print(f"📋 Found {len(services)} services")
             
-            # Debug: Show all characteristics and their properties
-            print("\n🔍 All available characteristics:")
-            for svc in services:
-                print(f"  Service: {svc.uuid}")
-                for ch in svc.characteristics:
-                    props = ",".join(sorted(ch.properties))
-                    print(f"    Char: {ch.uuid} | props={props}")
-            print()
-            
             # Find both temperature characteristics
             target_char = None
             drink_char = None
@@ -127,9 +118,6 @@ async def connect_and_monitor(device):
             if not drink_char:
                 print("⚠️  Drink temperature characteristic not found")
                 return True
-            
-            # Run write tests to debug the issue
-            await test_write_operations(client, target_char)
             
             # Monitor connection status
             print("📊 Monitoring temperatures...")
@@ -173,9 +161,9 @@ async def connect_and_monitor(device):
                                     new_target_bytes = bytes([0x13, 0x88])
                                     
                                     # Check if characteristic supports write
-                                    if "write" in target_char.properties or "write-without-response" in target_char.properties:
-                                        # Use write-without-response for immediate effect
-                                        await client.write_gatt_char(target_char, new_target_bytes, response=False)
+                                    if "write" in target_char.properties:
+                                        # Use write with response since write-without-response is not supported
+                                        await client.write_gatt_char(target_char, new_target_bytes, response=True)
                                         print(f"🔥 Drink too cold ({drink_temp:.1f}°C), setting target to 50°C")
                                         print(f"   Wrote bytes: {new_target_bytes.hex(' ').upper()} to {target_char.uuid}")
                                     else:
@@ -188,16 +176,11 @@ async def connect_and_monitor(device):
                             # Drink is warm enough, turn off heating
                             if target_temp != 0.0:
                                 try:
-                                    # 0°C = 0 = 0x0000
-                                    new_target_bytes = bytes([0x00, 0x00])
-                                    
-                                    if "write" in target_char.properties or "write-without-response" in target_char.properties:
-                                        await client.write_gatt_char(target_char, new_target_bytes, response=False)
-                                        print(f"❄️  Drink warm enough ({drink_temp:.1f}°C), turning off heating")
-                                        print(f"   Wrote bytes: {new_target_bytes.hex(' ').upper()} to {target_char.uuid}")
-                                    else:
-                                        print(f"⚠️  Target characteristic doesn't support write operations")
-                                        
+                                    # Set target to 0°C to turn off heating
+                                    off_bytes = bytes([0x00, 0x00])
+                                    await client.write_gatt_char(target_char, off_bytes, response=True)
+                                    print(f"❄️  Drink warm enough ({drink_temp:.1f}°C), turning off heating")
+                                    print(f"   Wrote bytes: {off_bytes.hex(' ').upper()} to {target_char.uuid}")
                                 except Exception as e:
                                     print(f"⚠️  Failed to turn off heating: {e}")
                                     print(f"   Characteristic properties: {target_char.properties}")
@@ -253,18 +236,12 @@ async def test_write_operations(client, target_char):
             
             print(f"  Testing {description}: {temp_bytes.hex(' ').upper()}")
             
-            # Try both write methods
+            # Try write with response
             if "write" in target_char.properties:
                 await client.write_gatt_char(target_char, temp_bytes, response=True)
                 print(f"    ✅ Write with response: OK")
             else:
                 print(f"    ❌ Write with response: Not supported")
-            
-            if "write-without-response" in target_char.properties:
-                await client.write_gatt_char(target_char, temp_bytes, response=False)
-                print(f"    ✅ Write without response: OK")
-            else:
-                print(f"    ❌ Write without response: Not supported")
                 
             # Wait a moment and read back
             await asyncio.sleep(1)
@@ -281,6 +258,50 @@ async def test_write_operations(client, target_char):
         print()
     
     print("🧪 Write testing complete")
+
+
+async def find_heating_control_characteristics(client, services):
+    """Look for characteristics that might actually control the heating."""
+    print("\n🔍 Searching for heating control characteristics...")
+    
+    # Look for characteristics with names or UUIDs that suggest heating control
+    heating_keywords = ['heat', 'power', 'control', 'switch', 'enable', 'active']
+    
+    for svc in services:
+        for ch in svc.characteristics:
+            # Check if characteristic has a name that suggests heating control
+            char_name = getattr(ch, 'name', '').lower()
+            char_uuid = ch.uuid.lower()
+            
+            # Check if it's writable and might control heating
+            if ("write" in ch.properties or "write-without-response" in ch.properties):
+                is_heating_control = False
+                
+                # Check name for heating-related keywords
+                for keyword in heating_keywords:
+                    if keyword in char_name or keyword in char_uuid:
+                        is_heating_control = True
+                        break
+                
+                # Check if it's a boolean/switch characteristic (1 byte)
+                if len(ch.uuid) > 8:  # Custom UUID
+                    is_heating_control = True
+                
+                if is_heating_control:
+                    print(f"   🔥 Potential heating control: {ch.uuid}")
+                    print(f"      Properties: {ch.properties}")
+                    if hasattr(ch, 'name') and ch.name:
+                        print(f"      Name: {ch.name}")
+                    
+                    # Try to read current value
+                    try:
+                        if "read" in ch.properties:
+                            value = await client.read_gatt_char(ch)
+                            print(f"      Current value: {value.hex(' ').upper()}")
+                    except Exception as e:
+                        print(f"      Read failed: {e}")
+                    
+                    print()
 
 
 async def main():
