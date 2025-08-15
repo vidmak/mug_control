@@ -1,16 +1,23 @@
 # ble_tool.py
 # Simple BLE CLI for macOS using bleak
-# - Scan and list devices
-# - Connect and list services/characteristics (read values when allowed)
-# - Write to a selected characteristic
+# - Automatically scan for specific mug device
+# - Connect and display status
+# - Write to characteristics when needed
 
 import asyncio
-from typing import Dict, Tuple, List
+import time
+from typing import Optional
 from bleak import BleakScanner, BleakClient
 from bleak.backends.characteristic import BleakGATTCharacteristic
 
-SCAN_SECONDS = 8
+# Configuration
+TARGET_DEVICE_ADDRESS = "C0AFF08D-F255-248A-1317-30DE4080E377"
+SCAN_INTERVAL = 5  # seconds between scans
+CONNECTION_TIMEOUT = 10  # seconds to wait for connection
 
+# Characteristic UUIDs
+TARGET_TEMP_CHAR = "fc540003-236c-4c94-8fa9-944a3e5353fa"
+DRINK_TEMP_CHAR = "fc540002-236c-4c94-8fa9-944a3e5353fa"
 
 def printable_bytes(b: bytes, max_len: int = 64) -> str:
     """Show both hex and (best-effort) UTF-8 preview."""
@@ -21,16 +28,6 @@ def printable_bytes(b: bytes, max_len: int = 64) -> str:
     except UnicodeDecodeError:
         text_part = "⟂"
     return f"hex[{hex_part}] | utf8[{text_part}]"
-
-
-def ask_index(prompt: str, upper: int) -> int:
-    while True:
-        s = input(f"{prompt} [0-{upper-1}]: ").strip()
-        if s.isdigit():
-            i = int(s)
-            if 0 <= i < upper:
-                return i
-        print("Invalid selection, try again.")
 
 
 def parse_write_value(s: str) -> bytes:
@@ -61,108 +58,176 @@ def parse_write_value(s: str) -> bytes:
     return s.encode("utf-8")
 
 
-async def list_and_pick_device():
-    print(f"Scanning for BLE devices ({SCAN_SECONDS}s)…")
-    devices = await BleakScanner.discover(timeout=SCAN_SECONDS)
-    if not devices:
-        print("No devices found. Try moving closer or increasing SCAN_SECONDS.")
-        return None
+async def find_target_device() -> Optional[object]:
+    """Continuously scan for the target mug device."""
+    print(f"🔍 Looking for mug device: {TARGET_DEVICE_ADDRESS}")
+    
+    while True:
+        try:
+            print(f"📡 Scanning... (every {SCAN_INTERVAL}s)")
+            devices = await BleakScanner.discover(timeout=SCAN_INTERVAL)
+            
+            for device in devices:
+                if device.address == TARGET_DEVICE_ADDRESS:
+                    print(f"✅ Found target device: {device.name or 'Unknown'} ({device.address})")
+                    return device
+            
+            print("❌ Target device not found, retrying...")
+            
+        except Exception as e:
+            print(f"⚠️  Scan error: {e}")
+        
+        await asyncio.sleep(1)  # Brief pause before next scan
 
-    # De-dup by address
-    unique: Dict[str, Tuple] = {}
-    for d in devices:
-        # In newer bleak versions, RSSI might not be directly accessible
-        # We'll use a default value and focus on device discovery
-        unique[d.address] = (d, d.name or "Unknown", None)
 
-    items = list(unique.values())
-    # Sort by address for consistent ordering since RSSI is not available
-    items.sort(key=lambda x: x[0].address)
+async def connect_and_monitor(device):
+    """Connect to device and monitor status."""
+    print(f"🔗 Attempting to connect to {device.name or 'Unknown'}...")
+    
+    try:
+        async with BleakClient(device, timeout=CONNECTION_TIMEOUT) as client:
+            if not client.is_connected:
+                print("❌ Failed to connect")
+                return False
+            
+            print("✅ Connected successfully!")
+            print("🔍 Discovering services...")
+            
+            services = list(client.services)
+            print(f"📋 Found {len(services)} services")
+            
+            # Find both temperature characteristics
+            target_char = None
+            drink_char = None
+            
+            for svc in services:
+                for ch in svc.characteristics:
+                    if ch.uuid == TARGET_TEMP_CHAR:
+                        target_char = ch
+                        print(f"🎯 Found target temperature characteristic: {ch.uuid}")
+                    elif ch.uuid == DRINK_TEMP_CHAR:
+                        drink_char = ch
+                        print(f"🌡️  Found drink temperature characteristic: {ch.uuid}")
+                if target_char and drink_char:
+                    break
+            
+            if not target_char:
+                print("⚠️  Target temperature characteristic not found")
+                return True
+                
+            if not drink_char:
+                print("⚠️  Drink temperature characteristic not found")
+                return True
+            
+            # Monitor connection status
+            print("📊 Monitoring temperatures...")
+            print("💡 Use Ctrl+C to exit")
+            print("-" * 50)
+            
+            while client.is_connected:
+                try:
+                    current_time = time.strftime("%H:%M:%S")
+                    
+                    # Read target temperature
+                    if "read" in target_char.properties:
+                        try:
+                            target_value = await client.read_gatt_char(target_char)
+                            target_temp = int.from_bytes(target_value, byteorder='little') / 100.0
+                        except Exception as e:
+                            target_temp = "Error"
+                    else:
+                        target_temp = "Not readable"
+                    
+                    # Read current drink temperature
+                    if "read" in drink_char.properties:
+                        try:
+                            drink_value = await client.read_gatt_char(drink_char)
+                            drink_temp = int.from_bytes(drink_value, byteorder='little') / 100.0
+                        except Exception as e:
+                            drink_temp = "Error"
+                    else:
+                        drink_temp = "Not readable"
+                    
+                    # Display both temperatures
+                    print(f"[{current_time}] 🎯 Target: {target_temp}°C | 🌡️ Drink: {drink_temp}°C")
+                    
+                    # Automatic temperature control logic
+                    if isinstance(drink_temp, (int, float)) and isinstance(target_temp, (int, float)):
+                        if drink_temp < 40.0:
+                            # Drink is too cold, set target to 50°C (minimum heating)
+                            if target_temp != 50.0:
+                                try:
+                                    # 50°C = 5000 = 0x8813 in little-endian
+                                    new_target_bytes = bytes([0x13, 0x88])
+                                    await client.write_gatt_char(target_char, new_target_bytes, response=False)
+                                    print(f"🔥 Drink too cold ({drink_temp:.1f}°C), setting target to 50°C")
+                                except Exception as e:
+                                    print(f"⚠️  Failed to set target temperature: {e}")
+                        elif drink_temp > 40.0:
+                            # Drink is warm enough, turn off heating
+                            if target_temp != 0.0:
+                                try:
+                                    # 0°C = 0 = 0x0000
+                                    new_target_bytes = bytes([0x00, 0x00])
+                                    await client.write_gatt_char(target_char, new_target_bytes, response=False)
+                                    print(f"❄️  Drink warm enough ({drink_temp:.1f}°C), turning off heating")
+                                except Exception as e:
+                                    print(f"⚠️  Failed to turn off heating: {e}")
+                    
+                    # Wait before next check
+                    await asyncio.sleep(3)
+                    
+                except asyncio.CancelledError:
+                    break
+                    
+        return True
+        
+    except Exception as e:
+        print(f"❌ Connection error: {e}")
+        return False
 
-    print("\nFound devices:")
-    for idx, (dev, name, _) in enumerate(items):
-        print(f"[{idx}] {name} | addr={dev.address}")
 
-    i = ask_index("Pick device", len(items))
-    return items[i][0]  # BleakDevice
+async def set_target_temperature(client, target_char, temperature_celsius):
+    """Manually set the target temperature."""
+    try:
+        # Convert temperature to the device's scale (×100)
+        temp_value = int(temperature_celsius * 100)
+        
+        # Convert to little-endian bytes
+        temp_bytes = temp_value.to_bytes(2, byteorder='little')
+        
+        # Write to characteristic without response
+        await client.write_gatt_char(target_char, temp_bytes, response=False)
+        
+        print(f"✅ Target temperature set to {temperature_celsius}°C ({temp_bytes.hex(' ').upper()})")
+        return True
+        
+    except Exception as e:
+        print(f"❌ Failed to set temperature: {e}")
+        return False
 
 
 async def main():
-    device = await list_and_pick_device()
-    if not device:
-        return
-
-    print(f"\nConnecting to {device.name or 'Unknown'} ({device.address})…")
-    async with BleakClient(device) as client:
-        if not client.is_connected:
-            print("Failed to connect.")
+    """Main function to find and connect to the target device."""
+    print("🚀 Mug Control BLE Tool")
+    print("=" * 40)
+    
+    try:
+        # Find the target device
+        device = await find_target_device()
+        if not device:
+            print("❌ Could not find target device")
             return
-        print("Connected.\nDiscovering services…")
-        services = list(client.services)
-        print(f"Discovered {len(services)} services.\n")
-
-        # Map index -> characteristic for selection later
-        writable: List[BleakGATTCharacteristic] = []
-
-        idx_counter = 0
-        for svc in services:
-            print(f"Service {svc.uuid}")
-            for ch in svc.characteristics:
-                props = ",".join(sorted(ch.properties))
-                # Try to read if 'read' in props
-                value_preview = ""
-                if "read" in ch.properties:
-                    try:
-                        v = await client.read_gatt_char(ch)
-                        value_preview = printable_bytes(v)
-                    except Exception as e:
-                        value_preview = f"(read error: {e})"
-                print(f"  [{idx_counter}] Char {ch.uuid} | props={props}")
-                if value_preview:
-                    print(f"      value: {value_preview}")
-
-                if "write" in ch.properties or "write-without-response" in ch.properties:
-                    writable.append(ch)
-                idx_counter += 1
-            print()
-
-        if not writable:
-            print("No writable characteristics found on this device.")
-            return
-
-        # Make a compact, numbered list of writable ones
-        print("Writable characteristics:")
-        for i, ch in enumerate(writable):
-            props = ",".join(sorted(ch.properties))
-            print(f"  ({i}) {ch.uuid} | props={props}")
-
-        w_idx = ask_index("Pick characteristic to WRITE", len(writable))
-        target: BleakGATTCharacteristic = writable[w_idx]
-
-        user_val = input(
-            "Enter value to write "
-            "(plain text, or 'hex:01 02 0A', or '0x01020a'): "
-        )
-        payload = parse_write_value(user_val)
-
-        # Pick write mode
-        with_response = "write" in target.properties
-        try:
-            await client.write_gatt_char(target, payload, response=with_response)
-            print(f"Write OK to {target.uuid} ({'with' if with_response else 'without'} response).")
-        except Exception as e:
-            print(f"Write failed: {e}")
-            return
-
-        # If readable, show new value
-        if "read" in target.properties:
-            try:
-                new_v = await client.read_gatt_char(target)
-                print(f"New value: {printable_bytes(new_v)}")
-            except Exception as e:
-                print(f"Read-after-write failed: {e}")
-
-    print("Disconnected.")
+        
+        # Connect and monitor
+        success = await connect_and_monitor(device)
+        if not success:
+            print("❌ Failed to establish connection")
+            
+    except KeyboardInterrupt:
+        print("\n👋 Exiting...")
+    except Exception as e:
+        print(f"❌ Unexpected error: {e}")
 
 
 if __name__ == "__main__":
