@@ -128,6 +128,11 @@ async def connect_and_monitor(device):
                 try:
                     current_time = time.strftime("%H:%M:%S")
                     
+                    # Check connection status
+                    if not client.is_connected:
+                        print("🔌 Connection lost, will attempt to reconnect...")
+                        break
+                    
                     # Read target temperature
                     if "read" in target_char.properties:
                         try:
@@ -135,6 +140,11 @@ async def connect_and_monitor(device):
                             target_temp = int.from_bytes(target_value, byteorder='little') / 100.0
                         except Exception as e:
                             target_temp = "Error"
+                            print(f"⚠️  Target temperature read error: {e}")
+                            # If we can't read, connection might be lost
+                            if "disconnected" in str(e).lower() or "timeout" in str(e).lower():
+                                print("🔌 Connection appears to be lost, will reconnect...")
+                                break
                     else:
                         target_temp = "Not readable"
                     
@@ -145,6 +155,11 @@ async def connect_and_monitor(device):
                             drink_temp = int.from_bytes(drink_value, byteorder='little') / 100.0
                         except Exception as e:
                             drink_temp = "Error"
+                            print(f"⚠️  Drink temperature read error: {e}")
+                            # If we can't read, connection might be lost
+                            if "disconnected" in str(e).lower() or "timeout" in str(e).lower():
+                                print("🔌 Connection appears to be lost, will reconnect...")
+                                break
                     else:
                         drink_temp = "Not readable"
                     
@@ -192,6 +207,11 @@ async def connect_and_monitor(device):
                     
                 except asyncio.CancelledError:
                     break
+                except Exception as e:
+                    print(f"⚠️  Monitoring error: {e}")
+                    if "disconnected" in str(e).lower() or "timeout" in str(e).lower():
+                        print("🔌 Connection appears to be lost, will reconnect...")
+                        break
                     
         return True
         
@@ -311,22 +331,32 @@ async def main():
     print("🚀 Mug Control BLE Tool")
     print("=" * 40)
     
-    try:
-        # Find the target device
-        device = await find_target_device()
-        if not device:
-            print("❌ Could not find target device")
-            return
-        
-        # Connect and monitor
-        success = await connect_and_monitor(device)
-        if not success:
-            print("❌ Failed to establish connection")
+    while True:  # Keep trying to reconnect
+        try:
+            # Find the target device
+            device = await find_target_device()
+            if not device:
+                print("❌ Could not find target device")
+                print("🔄 Retrying in 10 seconds...")
+                await asyncio.sleep(10)
+                continue
             
-    except KeyboardInterrupt:
-        print("\n👋 Exiting...")
-    except Exception as e:
-        print(f"❌ Unexpected error: {e}")
+            # Connect and monitor
+            success = await connect_and_monitor(device)
+            if not success:
+                print("❌ Failed to establish connection")
+                print("🔄 Retrying in 10 seconds...")
+                await asyncio.sleep(10)
+                continue
+                
+        except KeyboardInterrupt:
+            print("\n👋 Exiting...")
+            break
+        except Exception as e:
+            print(f"❌ Unexpected error: {e}")
+            print("🔄 Retrying in 10 seconds...")
+            await asyncio.sleep(10)
+            continue
 
 
 if __name__ == "__main__":
